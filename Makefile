@@ -1,5 +1,5 @@
 PROJECT = ghostbsd-bootsplash
-VERSION = 1.0.0
+VERSION = 0.0.1
 
 PREFIX ?= /usr/local
 EFIDIR = /boot/efi/EFI/GhostBSD
