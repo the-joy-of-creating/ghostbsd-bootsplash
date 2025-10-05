@@ -14,7 +14,8 @@ EFI_STATUS LoadBMPFromFile(EFI_FILE_PROTOCOL *Root, CHAR16 *FileName,
     }
     
     // Open the BMP file
-    Status = Root->Open(Root, &File, FileName, EFI_FILE_MODE_READ, 0);
+    Status = uefi_call_wrapper(Root->Open, 5, Root, &File, FileName, 
+                               EFI_FILE_MODE_READ, 0);
     if (EFI_ERROR(Status)) {
         return Status;
     }
@@ -22,13 +23,14 @@ EFI_STATUS LoadBMPFromFile(EFI_FILE_PROTOCOL *Root, CHAR16 *FileName,
     // Get file size
     FileInfo = AllocatePool(BufferSize);
     if (FileInfo == NULL) {
-        File->Close(File);
+        uefi_call_wrapper(File->Close, 1, File);
         return EFI_OUT_OF_RESOURCES;
     }
     
-    Status = File->GetInfo(File, &gEfiFileInfoGuid, &BufferSize, FileInfo);
+    Status = uefi_call_wrapper(File->GetInfo, 4, File, &gEfiFileInfoGuid, 
+                               &BufferSize, FileInfo);
     if (EFI_ERROR(Status)) {
-        File->Close(File);
+        uefi_call_wrapper(File->Close, 1, File);
         FreePool(FileInfo);
         return Status;
     }
@@ -39,12 +41,12 @@ EFI_STATUS LoadBMPFromFile(EFI_FILE_PROTOCOL *Root, CHAR16 *FileName,
     // Allocate buffer and read file
     *ImageData = AllocatePool(*ImageSize);
     if (*ImageData == NULL) {
-        File->Close(File);
+        uefi_call_wrapper(File->Close, 1, File);
         return EFI_OUT_OF_RESOURCES;
     }
     
-    Status = File->Read(File, ImageSize, *ImageData);
-    File->Close(File);
+    Status = uefi_call_wrapper(File->Read, 3, File, ImageSize, *ImageData);
+    uefi_call_wrapper(File->Close, 1, File);
     
     if (EFI_ERROR(Status)) {
         FreePool(*ImageData);
@@ -111,6 +113,7 @@ EFI_STATUS GetBMPDimensions(UINT8 *BmpData, UINTN BmpSize,
     return EFI_SUCCESS;
 }
 
+// OPTIMIZED: Use buffer blitting instead of pixel-by-pixel
 EFI_STATUS DisplayBMP(EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop, 
                       UINT8 *BmpData, UINTN BmpSize) {
     BMP_FILE_HEADER *FileHeader;
@@ -120,6 +123,8 @@ EFI_STATUS DisplayBMP(EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop,
     UINTN RowSize;
     UINT32 ScreenWidth, ScreenHeight;
     INT32 OffsetX, OffsetY;
+    EFI_GRAPHICS_OUTPUT_BLT_PIXEL *BltBuffer;
+    EFI_STATUS Status;
     
     if (Gop == NULL || BmpData == NULL) {
         return EFI_INVALID_PARAMETER;
@@ -152,45 +157,123 @@ EFI_STATUS DisplayBMP(EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop,
     
     // Clear screen to black
     EFI_GRAPHICS_OUTPUT_BLT_PIXEL Black = {0, 0, 0, 0};
-    Gop->Blt(Gop, &Black, EfiBltVideoFill, 
-             0, 0, 0, 0, 
-             ScreenWidth, ScreenHeight, 0);
+    Status = uefi_call_wrapper(Gop->Blt, 10, Gop, &Black, EfiBltVideoFill, 
+                               0, 0, 0, 0, 
+                               ScreenWidth, ScreenHeight, 0);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
     
-    // Draw BMP (BMPs are stored bottom-up unless height is negative)
+    // Determine if BMP is top-down or bottom-up
     BOOLEAN TopDown = (Height < 0);
     if (TopDown) {
         Height = -Height;
     }
     
+    // Allocate buffer for entire image
+    BltBuffer = AllocatePool(Width * Height * sizeof(EFI_GRAPHICS_OUTPUT_BLT_PIXEL));
+    if (BltBuffer == NULL) {
+        // Fall back to row-by-row rendering if we can't allocate full buffer
+        return DisplayBMPRowByRow(Gop, BmpData, BmpSize, OffsetX, OffsetY);
+    }
+    
+    // Convert BMP to BltBuffer format
     for (INT32 y = 0; y < Height; y++) {
+        for (INT32 x = 0; x < Width; x++) {
+            UINTN BmpIndex;
+            UINTN BltIndex;
+            
+            if (TopDown) {
+                BmpIndex = y * RowSize + x * 3;
+                BltIndex = y * Width + x;
+            } else {
+                // Bottom-up: flip Y coordinate
+                BmpIndex = (Height - 1 - y) * RowSize + x * 3;
+                BltIndex = y * Width + x;
+            }
+            
+            // Bounds check
+            if (BmpIndex + 2 >= BmpSize - FileHeader->OffBits) {
+                FreePool(BltBuffer);
+                return EFI_INVALID_PARAMETER;
+            }
+            
+            // Convert BGR to RGB
+            BltBuffer[BltIndex].Blue = PixelData[BmpIndex];
+            BltBuffer[BltIndex].Green = PixelData[BmpIndex + 1];
+            BltBuffer[BltIndex].Red = PixelData[BmpIndex + 2];
+            BltBuffer[BltIndex].Reserved = 0;
+        }
+    }
+    
+    // Blit entire image in one call (much faster!)
+    Status = uefi_call_wrapper(Gop->Blt, 10, Gop, BltBuffer, EfiBltBufferToVideo,
+                               0, 0,                    // Source X, Y
+                               OffsetX, OffsetY,        // Dest X, Y
+                               Width, Height,           // Width, Height
+                               0);                      // Delta (0 = width * pixel size)
+    
+    FreePool(BltBuffer);
+    return Status;
+}
+
+// Fallback: Row-by-row rendering if full buffer allocation fails
+static EFI_STATUS DisplayBMPRowByRow(EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop,
+                                     UINT8 *BmpData, UINTN BmpSize,
+                                     INT32 OffsetX, INT32 OffsetY) {
+    BMP_FILE_HEADER *FileHeader = (BMP_FILE_HEADER *)BmpData;
+    BMP_INFO_HEADER *InfoHeader = (BMP_INFO_HEADER *)(BmpData + sizeof(BMP_FILE_HEADER));
+    UINT8 *PixelData = BmpData + FileHeader->OffBits;
+    INT32 Width = InfoHeader->Width;
+    INT32 Height = InfoHeader->Height;
+    UINTN RowSize = ((Width * 3 + 3) / 4) * 4;
+    BOOLEAN TopDown = (Height < 0);
+    EFI_GRAPHICS_OUTPUT_BLT_PIXEL *RowBuffer;
+    EFI_STATUS Status = EFI_SUCCESS;
+    
+    if (TopDown) Height = -Height;
+    
+    // Allocate buffer for one row
+    RowBuffer = AllocatePool(Width * sizeof(EFI_GRAPHICS_OUTPUT_BLT_PIXEL));
+    if (RowBuffer == NULL) {
+        return EFI_OUT_OF_RESOURCES;
+    }
+    
+    // Draw row by row
+    for (INT32 y = 0; y < Height; y++) {
+        // Convert one row
         for (INT32 x = 0; x < Width; x++) {
             UINTN BmpIndex;
             
             if (TopDown) {
                 BmpIndex = y * RowSize + x * 3;
             } else {
-                // Bottom-up: flip Y coordinate
                 BmpIndex = (Height - 1 - y) * RowSize + x * 3;
             }
             
-            // Bounds check
             if (BmpIndex + 2 >= BmpSize - FileHeader->OffBits) {
-                continue;
+                FreePool(RowBuffer);
+                return EFI_INVALID_PARAMETER;
             }
             
-            EFI_GRAPHICS_OUTPUT_BLT_PIXEL Pixel;
-            Pixel.Blue = PixelData[BmpIndex];
-            Pixel.Green = PixelData[BmpIndex + 1];
-            Pixel.Red = PixelData[BmpIndex + 2];
-            Pixel.Reserved = 0;
-            
-            // Draw pixel
-            Gop->Blt(Gop, &Pixel, EfiBltVideoFill,
-                     0, 0,
-                     OffsetX + x, OffsetY + y,
-                     1, 1, 0);
+            RowBuffer[x].Blue = PixelData[BmpIndex];
+            RowBuffer[x].Green = PixelData[BmpIndex + 1];
+            RowBuffer[x].Red = PixelData[BmpIndex + 2];
+            RowBuffer[x].Reserved = 0;
+        }
+        
+        // Blit one row
+        Status = uefi_call_wrapper(Gop->Blt, 10, Gop, RowBuffer, EfiBltBufferToVideo,
+                                   0, 0,                    // Source X, Y
+                                   OffsetX, OffsetY + y,    // Dest X, Y
+                                   Width, 1,                // Width, Height (1 row)
+                                   0);
+        
+        if (EFI_ERROR(Status)) {
+            break;
         }
     }
     
-    return EFI_SUCCESS;
+    FreePool(RowBuffer);
+    return Status;
 }
