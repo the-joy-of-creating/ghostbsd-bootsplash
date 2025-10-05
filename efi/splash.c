@@ -21,7 +21,7 @@ EFI_STATUS ChainloadBootloader(EFI_HANDLE ImageHandle, CHAR16 *BootloaderPath) {
     
     // Get our own loaded image
     Status = uefi_call_wrapper(BS->HandleProtocol, 3, ImageHandle, 
-                               &LoadedImageProtocol, (VOID **)&LoadedImage);
+                               &gEfiLoadedImageProtocolGuid, (VOID **)&LoadedImage);
     if (EFI_ERROR(Status)) {
         return Status;
     }
@@ -96,8 +96,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         Print(L"════════════════════════════════════════════════════\n\n");
     }
     
-    // Locate Graphics Output Protocol
-    Status = uefi_call_wrapper(BS->LocateProtocol, 3, &GraphicsOutputProtocol, 
+    // Locate Graphics Output Protocol (CORRECTED)
+    Status = uefi_call_wrapper(BS->LocateProtocol, 3, &gEfiGraphicsOutputProtocolGuid, 
                                NULL, (VOID **)&Gop);
     if (EFI_ERROR(Status)) {
         if (gDebugMode) {
@@ -112,10 +112,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         DisplayBootInfo(Gop);
     }
     
-    // Get filesystem access
+    // Get filesystem access (CORRECTED)
     EFI_LOADED_IMAGE_PROTOCOL *LoadedImage;
     Status = uefi_call_wrapper(BS->HandleProtocol, 3, ImageHandle, 
-                               &LoadedImageProtocol, (VOID **)&LoadedImage);
+                               &gEfiLoadedImageProtocolGuid, (VOID **)&LoadedImage);
     if (EFI_ERROR(Status)) {
         if (gDebugMode) {
             DisplayError(L"Failed to Get Loaded Image", 
@@ -124,8 +124,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         goto boot;
     }
     
+    // Open filesystem (CORRECTED)
     Status = uefi_call_wrapper(BS->HandleProtocol, 3, LoadedImage->DeviceHandle,
-                               &FileSystemProtocol, (VOID **)&FileSystem);
+                               &gEfiSimpleFileSystemProtocolGuid, (VOID **)&FileSystem);
     if (EFI_ERROR(Status)) {
         if (gDebugMode) {
             DisplayError(L"Failed to Get Filesystem", 
